@@ -81,6 +81,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## TODO
+
+A few ideas are also still to be implemented, and, apart from optimization, this is what's currently on the roadmap:
+
+- [ ] Support for moving old events between hot, cool and cold storage;
+- [ ] On-the-fly encryption support;
+
 ## License
 
 This library is distributed under the terms of the Mozilla Public License, version 2.0.
