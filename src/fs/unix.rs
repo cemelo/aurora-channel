@@ -3,8 +3,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 
-use bytes::{Buf, BufMut};
-use futures::io::{Error, IoSlice, IoSliceMut, SeekFrom};
+use futures::io::{IoSlice, IoSliceMut, SeekFrom};
 use futures::task::{Context, Poll};
 use futures::Future;
 use libc::{flock, EBADF, EINTR, ENOLCK, EWOULDBLOCK, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN};
@@ -12,6 +11,9 @@ use libc::{flock, EBADF, EINTR, ENOLCK, EWOULDBLOCK, LOCK_EX, LOCK_NB, LOCK_SH, 
 use crate::fs::errors::LockError;
 
 pub trait FdLock: AsRawFd + Unpin + Sized {
+  /// Acquires an exclusive lock to the file descriptor.
+  ///
+  /// The underlying future will run on a loop until the lock is acquired.
   fn lock_exclusive(self) -> FutureFdLock<Self> {
     FutureFdLock {
       inner_fd: Some(self),
@@ -19,6 +21,9 @@ pub trait FdLock: AsRawFd + Unpin + Sized {
     }
   }
 
+  /// Acquires a shared lock to the file descriptor.
+  ///
+  /// The underlying future will run on a loop until the lock is acquired.
   fn lock_shared(self) -> FutureFdLock<Self> {
     FutureFdLock {
       inner_fd: Some(self),
@@ -160,58 +165,6 @@ impl<T: AsRawFd + std::io::Write> std::io::Write for FdAdvisoryLock<T> {
 impl<T: AsRawFd + std::io::Seek> std::io::Seek for FdAdvisoryLock<T> {
   fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
     self.fd.seek(pos)
-  }
-}
-
-impl<T: AsRawFd + tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FdAdvisoryLock<T> {
-  fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<tokio::io::Result<usize>> {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_read(cx, buf)
-  }
-
-  fn poll_read_buf<B: BufMut>(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut B) -> Poll<tokio::io::Result<usize>>
-  where
-    Self: Sized,
-  {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_read_buf(cx, buf)
-  }
-}
-
-impl<T: AsRawFd + tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FdAdvisoryLock<T> {
-  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_write(cx, buf)
-  }
-
-  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_flush(cx)
-  }
-
-  fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_shutdown(cx)
-  }
-
-  fn poll_write_buf<B: Buf>(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut B) -> Poll<Result<usize, Error>>
-  where
-    Self: Sized,
-  {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_write_buf(cx, buf)
   }
 }
 
