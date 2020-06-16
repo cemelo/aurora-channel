@@ -15,8 +15,8 @@ latency whenever they conflict. At a high level, it provides:
 - unbounded sub-millisecond IPC;
 - journaled writes and deterministic replay support.
 
-It uses BSD advisory locks through the [flock]() syscall to coordinate read/write access to the metadata and the 
-compression task. It also uses append only writes and, thus, does not support inserts or deletions.
+It uses BSD advisory locks through the [flock]() syscall to coordinate read/write access to the metadata and 
+data/index file resizes. It also uses append only writes and, thus, does not support inserts or deletions.
 
 ## Performance
 
