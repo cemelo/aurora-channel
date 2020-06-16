@@ -33,7 +33,7 @@ pub struct ChannelBuilder {
 #[derive(Error, Debug)]
 pub enum ChannelConfigError {
   #[error("The path {0} does not exist or is a not a directory.")]
-  InvalidSecondaryStoragePath(String),
+  InvalidStoragePath(String),
   #[error("Invalid secondary storage cycle. Must be greater than {0}.")]
   InvalidSecondaryStorageCycle(u64),
   #[error("I/O Error")]
@@ -74,7 +74,7 @@ impl ChannelBuilder {
   ) -> Result<Self, ChannelConfigError> {
     let path = Path::new(cool_storage_path.as_ref());
     if !(path.exists() && path.is_dir()) {
-      return Err(ChannelConfigError::InvalidSecondaryStoragePath(
+      return Err(ChannelConfigError::InvalidStoragePath(
         cool_storage_path.as_ref().to_string_lossy().to_string(),
       ));
     }
@@ -97,7 +97,7 @@ impl ChannelBuilder {
 
     let path = Path::new(cold_storage_path.as_ref());
     if !(path.exists() && path.is_dir()) {
-      return Err(ChannelConfigError::InvalidSecondaryStoragePath(
+      return Err(ChannelConfigError::InvalidStoragePath(
         cold_storage_path.as_ref().to_string_lossy().to_string(),
       ));
     }
@@ -133,6 +133,14 @@ impl ChannelBuilder {
   }
 
   pub async fn build<T: Serialize + DeserializeOwned + ?Sized>(self) -> Result<Channel<T>, ChannelConfigError> {
+    if !self.hot_storage_path.exists() {
+      tokio::fs::create_dir_all(&self.hot_storage_path).await?;
+    }
+
+    if !self.hot_storage_path.is_dir() {
+      return Err(ChannelConfigError::InvalidStoragePath(format!("{}", self.hot_storage_path.to_string_lossy())));
+    }
+
     let metadata_file = OpenOptions::new()
       .create(true)
       .write(true)
