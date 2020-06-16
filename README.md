@@ -1,6 +1,6 @@
 # Aurora-Channel
 
-An asynchronous, journaled and unbounded MPMC channel for writing persistent messaging applications.
+A lock-free, journaled and unbounded MPMC broadcast channel for writing persistent messaging applications.
 
 *NOTE*: this is experimental software, not suitable for usage in production systems.
  
