@@ -1,6 +1,6 @@
 # Aurora-Channel
 
-A lock-free, journaled and unbounded MPMC broadcast channel for writing persistent messaging applications.
+A journaled and unbounded MPMC broadcast channel for writing persistent messaging applications.
 
 *NOTE*: this is experimental software, not suitable for usage in production systems.
  
@@ -11,7 +11,7 @@ It uses shared memory backed by memory mapped files ([memmap](https://crates.io/
 is to provide durable topics and deterministic message replaying with low latency and high throughput — favoring
 latency whenever they conflict. At a high level, it provides:
 
-- lock free writes and reads (in platforms that provide atomic primitives);
+- (mostly) lock free writes and reads (in platforms that provide atomic primitives);
 - unbounded sub-millisecond IPC;
 - journaled writes and deterministic replay support.
 
