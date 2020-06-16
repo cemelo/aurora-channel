@@ -1,6 +1,7 @@
 use std::fmt::Arguments;
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 
 use futures::io::{IoSlice, IoSliceMut, SeekFrom};
@@ -36,7 +37,7 @@ impl<T: AsRawFd + Unpin> FdLock for T {}
 
 pub trait SyncFdLock: AsRawFd + Sized {
   fn try_lock_exclusive(self) -> Result<FdAdvisoryLock<Self>, LockError> {
-    try_lock(&self, LOCK_SH)?;
+    try_lock(&self, LOCK_EX)?;
     Ok(FdAdvisoryLock { fd: self })
   }
 
@@ -96,6 +97,29 @@ pub struct FdAdvisoryLock<T: AsRawFd> {
   fd: T,
 }
 
+impl<T: AsRawFd> FdAdvisoryLock<T> {
+  pub fn unlock(self) -> T {
+    let mut no_drop_self = ManuallyDrop::new(self);
+    no_drop_self.internal_unlock();
+
+    // SAFETY: `self` is effectivelly dropped at this point.
+    let inner = std::mem::replace(&mut no_drop_self.fd, unsafe { std::mem::zeroed() });
+    inner
+  }
+
+  fn internal_unlock(&self) {
+    if unsafe { flock(self.fd.as_raw_fd(), LOCK_UN | LOCK_NB) } != 0 {
+      panic!("Could not unlock the file descriptor");
+    }
+  }
+}
+
+impl<T: AsRawFd> Into<std::fs::File> for FdAdvisoryLock<T> {
+  fn into(self) -> std::fs::File {
+    unsafe { std::fs::File::from_raw_fd(self.fd.as_raw_fd()) }
+  }
+}
+
 impl<T: AsRawFd> Deref for FdAdvisoryLock<T> {
   type Target = T;
 
@@ -112,9 +136,7 @@ impl<T: AsRawFd> DerefMut for FdAdvisoryLock<T> {
 
 impl<T: AsRawFd> Drop for FdAdvisoryLock<T> {
   fn drop(&mut self) {
-    if unsafe { flock(self.fd.as_raw_fd(), LOCK_UN | LOCK_NB) } != 0 {
-      panic!("Could not unlock the file descriptor");
-    }
+    self.internal_unlock()
   }
 }
 
@@ -171,10 +193,13 @@ impl<T: AsRawFd + std::io::Seek> std::io::Seek for FdAdvisoryLock<T> {
 #[cfg(test)]
 mod test {
   use std::fs::File;
+  use std::process::exit;
 
   use libc::{LOCK_EX, LOCK_SH};
+  use nix::sys::wait::{waitpid, WaitStatus};
+  use nix::unistd::{fork, ForkResult};
 
-  use crate::fs::FdLock;
+  use crate::fs::{FdLock, SyncFdLock};
 
   use super::{try_lock, LockError};
 
@@ -281,5 +306,57 @@ mod test {
 
     assert!(acquire_exclusive.await.is_ok());
     assert!(acquire_shared.await.is_ok());
+  }
+
+  #[test]
+  fn should_drop_when_converted_into_a_file() -> std::io::Result<()> {
+    let fd_a = tempfile::NamedTempFile::new().unwrap();
+    let path = fd_a.path().to_path_buf();
+
+    let res_a = fd_a.try_lock_exclusive();
+
+    assert!(res_a.is_ok());
+
+    match fork() {
+      Ok(ForkResult::Child) => {
+        let fd_b = File::open(path).unwrap();
+        let res_a = fd_b.try_lock_exclusive();
+
+        if res_a.is_ok() {
+          exit(0);
+        } else {
+          exit(1);
+        }
+      }
+      Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
+        Ok(WaitStatus::Exited(_, status)) => assert_eq!(1, status),
+        Ok(_) => assert!(false),
+        Err(err) => panic!("[main] waitpid() failed: {}", err),
+      },
+      _ => assert!(false),
+    }
+
+    let _dropped = res_a.unwrap().unlock();
+
+    match fork() {
+      Ok(ForkResult::Child) => {
+        let fd_b = File::open(path).unwrap();
+        let res_a = fd_b.try_lock_exclusive();
+
+        if res_a.is_ok() {
+          exit(0);
+        } else {
+          exit(1);
+        }
+      }
+      Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
+        Ok(WaitStatus::Exited(_, status)) => assert_eq!(0, status),
+        Ok(_) => assert!(false),
+        Err(err) => panic!("[main] waitpid() failed: {}", err),
+      },
+      _ => assert!(false),
+    }
+
+    Ok(())
   }
 }

@@ -1,42 +1,33 @@
 [package]
 name = "aurora-channel"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Carlos Eduardo Melo <ceduardo.melo@redime.com.br>"]
 edition = "2018"
 license-file = "LICENSE"
 
 [features]
-#default = ["format-bincode", "compression-snappy"]
-#format-bincode = ["bincode"]
-#format-json = ["serde_json"]
-#compression-snappy = ["snap"]
-#compression-lz4 = ["lz4"]
+default = ["format-bincode", "compression-snappy"]
+format-bincode = ["bincode"]
+format-json = ["serde_json"]
+compression-snappy = ["snap"]
+compression-lz4 = ["lz4"]
 
 [dependencies]
-#blocking = "^0.3"
 bytes = "^0.5"
 byteorder = "^1.3"
 chrono = "^0.4"
 errno = "^0.2"
 futures = "^0.3"
-async-std = { version = "1.6.0", features = ["attributes"] }
-#log = "^0.4"
+memmap = "^0.7"
 serde = { version = "^1.0", features = ["derive"] }
 thiserror = "^1.0"
-#tokio = { version = "^0.2", features = ["full"] }
-#
-## Optional dependencies used by features
-bincode = { version = "^1.2" }
-#serde_json = { version = "^1.0", optional = true }
-#snap = { version = "^1.0", optional = true }
-#lz4 = { version = "^1.23", optional = true }
-#ring = { version = "0.17.0-alpha.1", optional = true }
+tokio = { version = "^0.2", features = ["full"] }
 
-# New dependencies
-memmap = "^0.7"
-#rand = "0.7.3"
-#ctrlc = "3.1.4"
-lazy_static ="^1.4"
+## Optional dependencies used by features
+bincode = { version = "^1.2", optional = true }
+serde_json = { version = "^1.0", optional = true }
+snap = { version = "^1.0", optional = true }
+lz4 = { version = "^1.23", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "^0.2"
@@ -45,8 +36,8 @@ libc = "^0.2"
 tokio = { version = "^0.2", features = ["full"] }
 criterion = "^0.3"
 tempfile = "^3.1"
-#cc = "1.0.53"
-#
-#[[bench]]
-#name = "single_threaded"
-#harness = false
+nix = "^0.17"
+
+[[bench]]
+name = "single_threaded"
+harness = false

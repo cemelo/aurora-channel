@@ -1,23 +1,34 @@
-use std::fs::{File, OpenOptions};
+use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use memmap::{MmapMut, MmapOptions};
-use thiserror::Error;
-
-use crate::fs::{FdAdvisoryLock, FdLock, SyncFdLock};
-use crate::{ChannelMetadata, WireFormat};
+use serde::export::PhantomData;
 use serde::Serialize;
+use thiserror::Error;
+use tokio::fs::OpenOptions;
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-
-// Should we change this to some constant over the average element size?
-const FILE_EXPANSION_FACTOR: f64 = 0.5;
-const INITIAL_FILE_SIZE: u64 = 1024;
+use crate::fs::FdLock;
+use crate::index::Index;
+use crate::metadata::{ChannelMetadata, WireFormat};
 
 /// Sending half of a file backed channel.
-/// May be used from many threads. Messages can be sent with [`send`][Sender::send].
-pub struct Sender {
+/// May be used from a single thread only. Messages can be sent with [`send`][Sender::send].
+///
+/// Index file format:
+///
+/// ```text
+/// 0                7
+/// +-----------------+
+/// |   Index Size    |
+/// +-----------------+
+/// |      Cycle      |
+/// +-----------------+
+/// | Cursor Position |
+/// +-----------------+
+///         ...
+/// ```
+pub struct Sender<T: Serialize + ?Sized> {
   /// The hot storage path.
   hot_storage_path: PathBuf,
 
@@ -28,185 +39,192 @@ pub struct Sender {
   data: MmapMut,
 
   /// The shared memory used to store the index.
-  index: MmapMut,
+  index: Index,
 
-  /// The starting offset of mapped memory in relation to the backing file.
-  ///
-  /// This is used to perform conversions between relative and absolute addressing, and to avoid
-  /// mapping the entire file in memory for a particular sender.
-  data_cursor_offset: usize,
-
+  /// The current roll cycle.
   current_cycle: i64,
+
+  data_type: PhantomData<T>,
 }
 
 #[derive(Error, Debug)]
 pub enum SenderError {
-  #[error("I/O Error")]
+  #[error("I/O error")]
   IoError(#[from] std::io::Error),
-  #[error("File Locking Error")]
+  #[error("File locking error")]
   LockError(#[from] crate::fs::LockError),
+  #[error("Indexing error")]
+  IndexError(#[from] crate::index::IndexError),
+  #[cfg(feature = "format-bincode")]
+  #[error("Bincode serialization error")]
+  BincodeSerializationError(#[from] bincode::Error),
+  #[cfg(feature = "format-json")]
+  #[error("Json serialization error")]
+  JsonSerializationError(#[from] serde_json::Error),
+  #[error("Unknown error")]
+  UnknownError(#[from] Box<dyn Error>),
 }
 
-impl Sender {
+impl<T: Serialize + ?Sized> Sender<T> {
   pub(crate) async fn new(hot_storage_path: impl AsRef<Path>, metadata: ChannelMetadata) -> Result<Self, SenderError> {
-    let (current_cycle, file) = Sender::get_current_file(&hot_storage_path, &metadata).await?;
-    let (index, data, data_cursor_offset) = Sender::get_sender_params_from_file(&file, &metadata)?;
+    let index = Index::new(&hot_storage_path, metadata.index_block_size).await?;
 
-    Ok(Sender {
+    let mut sender = Sender {
       hot_storage_path: hot_storage_path.as_ref().to_path_buf(),
       metadata,
-      data,
       index,
-      data_cursor_offset,
-      current_cycle,
-    })
-  }
+      current_cycle: 0,
+      data_type: Default::default(),
 
-  pub async fn send<T: Serialize + Sized>(&mut self, data: &T) -> Result<(), SenderError> {
-    // First we check whether we should move to the next file based on the roll cycle.
-    if self.current_cycle < self.metadata.roll_cycle.current_cycle() {
-      let (current_cycle, file) = Sender::get_current_file(&self.hot_storage_path, &self.metadata).await?;
-      let (index, data, data_cursor_offset) = Sender::get_sender_params_from_file(&file, &self.metadata)?;
-
-      self.index = index;
-      self.data = data;
-      self.data_cursor_offset = data_cursor_offset;
-      self.current_cycle = current_cycle;
-    }
-
-    let current_index_position = self.acquire_next_index_position();
-
-    // Set the initial cursor position to the last written byte.
-    let mut cursor_position = if current_index_position == 0 {
-      self.metadata.index_size + 1
-    } else {
-      self.read_from_index(current_index_position as usize - 1)
+      data: MmapMut::map_anon(1)?,
     };
 
-    // Wait until all previous writes have committed their object size.
-    loop {
-      if cursor_position != 0 {
-        break;
-      } else {
-        // The index is guaranteed to be zeroed so, if a position is equal to zero, it means this operation
-        // is still in uncommitted state. A negative cursor position means an uncommitted operation,
-        // but with a committed range.
+    sender.update_data_file().await?;
 
-        async_std::task::sleep(Duration::from_micros(10)).await;
-        cursor_position = self.read_from_index(current_index_position as usize - 1).abs();
+    Ok(sender)
+  }
+
+  pub async fn send(&mut self, data: &T) -> Result<(), SenderError> {
+    // Checks and updates the current cycle
+    if self.current_cycle < self.metadata.roll_cycle.current_cycle() {
+      self.update_data_file().await?;
+    }
+
+    let element_size = match self.metadata.wire_format {
+      #[cfg(feature = "format-bincode")]
+      WireFormat::Bincode => bincode::serialized_size(data)?,
+      #[cfg(feature = "format-json")]
+      WireFormat::Json => serde_json::ser::to_string(data)?.len() as u64,
+    };
+
+    // Acquire the next index position
+    let (element_index, write_cursor_position) = self.reserve_writeable_slot(element_size).await?;
+
+    // Check whether there's any space left in the data file
+    while !self.has_enough_memory_available(write_cursor_position, element_size) {
+      self.expand_memory().await?;
+    }
+
+    // SAFETY: we always check whether the memory mapped file has enough room to write the current
+    // element. Atomic semantics also guarantee that the space to be written was already
+    // reserved in `self.reserve_writeable_slot(element_size: u64)`.
+    unsafe {
+      let target_ptr = self.data.as_mut_ptr().add(write_cursor_position as usize);
+      let data_slice = std::slice::from_raw_parts_mut(target_ptr, element_size as usize);
+
+      match self.metadata.wire_format {
+        #[cfg(feature = "format-bincode")]
+        WireFormat::Bincode => bincode::serialize_into(data_slice, data)?,
+        #[cfg(feature = "format-json")]
+        WireFormat::Json => serde_json::ser::to_writer(data_slice, data)?,
       }
     }
 
-    // At this point, the previous write was completed and now we can proceed.
-    match self.metadata.wire_format {
-      WireFormat::Raw => {
-        let element_size = std::mem::size_of::<T>() as i64;
-
-        // Commit element size with a negative position.
-        self.write_to_index(current_index_position as usize, -(cursor_position + element_size));
-
-        let data_write_offset = cursor_position as usize - self.data_cursor_offset;
-        unsafe {
-          let target_ptr = self.data.as_mut_ptr().offset(data_write_offset as isize);
-          std::ptr::copy(data, target_ptr.cast(), 1);
-        }
-
-        // Commit operation by flipping the signal.
-        self.write_to_index(current_index_position as usize, cursor_position + element_size);
-      }
-    }
+    // Commit operation by storing the current cycle
+    self.index[element_index]
+      .cycle_timestamp
+      .store(self.current_cycle, Ordering::SeqCst);
 
     Ok(())
   }
 
-  /// Acquires a position in the index and data file.
-  fn acquire_next_index_position(&mut self) -> usize {
-    let next_free_index_position_register = unsafe { &*self.index.as_ptr().cast::<AtomicU64>() };
-    let current_index_position = next_free_index_position_register.fetch_add(1, Ordering::SeqCst);
+  async fn update_data_file(&mut self) -> Result<(), SenderError> {
+    // Update the current cycle
+    self.current_cycle = self.metadata.roll_cycle.current_cycle();
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe {
-      // Write back the cache line if available in the target platform.
-      crate::atomic::x86_64::clwb(self.index.as_ptr());
+    let data_file = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .open(
+        self
+          .hot_storage_path
+          .join(&self.metadata.roll_cycle.data_file_name(self.current_cycle)),
+      )
+      .await?;
+
+    let mut locked_data_file = data_file.lock_exclusive().await?;
+    if locked_data_file.metadata().await?.len() == 0 {
+      locked_data_file.set_len(self.metadata.data_block_size).await?;
     }
 
-    current_index_position as usize
+    let data_file = locked_data_file.unlock().into_std().await;
+    self.data = unsafe { MmapOptions::new().map_mut(&data_file)? };
+
+    Ok(())
   }
 
-  async fn get_current_file(
-    hot_storage_path: impl AsRef<Path>,
-    metadata: &ChannelMetadata,
-  ) -> Result<(i64, FdAdvisoryLock<File>), SenderError> {
-    // Get the current queue file.
-    let current_cycle = metadata.roll_cycle.current_cycle();
-    let file = OpenOptions::new().read(true).write(true).create(true).open(
-      hot_storage_path
-        .as_ref()
-        .join(metadata.roll_cycle.file_name(current_cycle)),
-    )?;
+  async fn reserve_writeable_slot(&mut self, element_size: u64) -> Result<(u64, i64), SenderError> {
+    loop {
+      self.index.expand().await?;
 
-    // Try locking the file. If we can't acquire an exclusive (write) lock, try acquiring a (read) lock.
-    let file = if let Ok(locked_file) = file.try_lock_exclusive() {
-      if locked_file.metadata()?.len() == 0 {
-        locked_file.set_len(metadata.index_size as u64 + INITIAL_FILE_SIZE)?;
+      let current_index_size = self.index.len();
+      let current_index_element = &self.index[current_index_size];
+
+      let starting_cursor_position = if current_index_size == 0 {
+        0
+      } else {
+        let prev_index_element = &self.index[current_index_size - 1];
+        prev_index_element.last_cursor_position.load(Ordering::SeqCst).abs()
+      };
+
+      if current_index_element.last_cursor_position.compare_and_swap(
+        0,
+        starting_cursor_position + element_size as i64,
+        Ordering::SeqCst,
+      ) == 0
+      {
+        // Commit succeeded. Increase the index size.
+        self.index.increment_size(Ordering::SeqCst);
+
+        // #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        // unsafe {
+        //   // Write back the cache lines if available in the target platform.
+        //   crate::atomic::x86_64::clwb(self.index.as_ptr().cast::<AtomicU64>());
+        //   crate::atomic::x86_64::clwb(
+        //     self
+        //       .index
+        //       .as_ptr()
+        //       .cast::<AtomicI64>()
+        //       .add(current_index_position as usize),
+        //   );
+        // }
+
+        return Ok((current_index_size, starting_cursor_position.abs()));
       }
-
-      locked_file
-    } else {
-      let file = OpenOptions::new().read(true).write(true).create(true).open(
-        hot_storage_path
-          .as_ref()
-          .join(metadata.roll_cycle.file_name(current_cycle)),
-      )?;
-
-      file.lock_shared().await?
-    };
-
-    Ok((current_cycle, file))
-  }
-
-  fn get_sender_params_from_file(
-    file: &File,
-    metadata: &ChannelMetadata,
-  ) -> Result<(MmapMut, MmapMut, usize), SenderError> {
-    let index = unsafe { MmapOptions::new().len(metadata.index_size as usize).map_mut(&file)? };
-
-    // The first 8-bytes of every queue file specify the next free index position. Newly created queue
-    // files have these guaranteed to be zeroed.
-    let next_free_index_position = unsafe { (*(index.as_ptr().cast::<AtomicU64>())).load(Ordering::SeqCst) } as usize;
-
-    let data_cursor_offset = if next_free_index_position == 0 {
-      // Set the cursor position to the beginning of the data section. The cursor address is relative to
-      // the backing file, and not to the mapped memory section.
-      metadata.index_size as i64 + 1
-    } else {
-      // If this sender is created over an existing queue (writable_index > 0), we need to move the cursor
-      // to the free position.
-      unsafe { *(index.as_ptr().cast::<i64>().add(next_free_index_position - 1)) }
-    };
-
-    // This is used merely to expand the mapped memory by a factor relative to the file size. In the
-    // future we should have a better system, probably based on a factor of the file growth instead.
-    let file_length = file.metadata()?.len();
-
-    let data = unsafe {
-      MmapOptions::new()
-        .offset(data_cursor_offset.abs() as u64)
-        .len((file_length as f64 * FILE_EXPANSION_FACTOR) as usize)
-        .map_mut(&file)?
-    };
-
-    Ok((index, data, data_cursor_offset.abs() as usize))
-  }
-
-  fn read_from_index(&self, position: usize) -> i64 {
-    unsafe { *self.index.as_ptr().cast::<i64>().add(1 + position) }
-  }
-
-  fn write_to_index(&mut self, position: usize, size: i64) {
-    unsafe {
-      let idx_element_ptr = self.index.as_mut_ptr().cast::<i64>().add(position + 1);
-      *idx_element_ptr = size;
     }
+  }
+
+  fn has_enough_memory_available(&self, position: i64, element_size: u64) -> bool {
+    self.data.len() as u64 >= position as u64 + element_size
+  }
+
+  async fn expand_memory(&mut self) -> Result<(), SenderError> {
+    let data_file = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .open(
+        self
+          .hot_storage_path
+          .join(&self.metadata.roll_cycle.data_file_name(self.current_cycle)),
+      )
+      .await?;
+
+    let mut locked_data_file = data_file.lock_exclusive().await?;
+
+    // Only resizes file if it's length is too close to the mapped memory size.
+    // This should prevent concurrent tasks from resizing the file at the same point.
+    let current_length = locked_data_file.metadata().await?.len();
+    if current_length < self.data.len() as u64 + self.metadata.data_block_size {
+      locked_data_file
+        .set_len(current_length + self.metadata.data_block_size)
+        .await?;
+    }
+
+    let data_file = locked_data_file.unlock().into_std().await;
+    self.data = unsafe { MmapOptions::new().map_mut(&data_file)? };
+
+    Ok(())
   }
 }
