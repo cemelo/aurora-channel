@@ -1,23 +1,12 @@
-#![feature(backtrace)]
+pub use crate::buider::ChannelBuilder;
+pub use crate::metadata::{CompressionFormat, ConversionError, RollCycle, WireFormat};
+pub use crate::receiver::Receiver;
+pub use crate::sender::Sender;
 
-pub use crate::builder::QueueBuilder;
-pub use crate::compression::CompressionFormat;
-pub use crate::queue::*;
-pub use crate::receiver::*;
-pub use crate::sender::*;
-
-mod builder;
-mod compression;
-mod crypto;
+mod buider;
+mod channel;
 mod fs;
-mod indexer;
-mod queue;
+mod index;
+mod metadata;
 mod receiver;
 mod sender;
-
-const W_TRUE: u8 = 0xFFu8;
-const W_FALSE: u8 = 0u8;
-
-const W_HOT_STORAGE: u8 = 0xFFu8;
-const W_COOL_STORAGE: u8 = 0xF0u8;
-const W_COLD_STORAGE: u8 = 0x0Fu8;

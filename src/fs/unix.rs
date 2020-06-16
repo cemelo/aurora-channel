@@ -1,10 +1,10 @@
 use std::fmt::Arguments;
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 
-use bytes::{Buf, BufMut};
-use futures::io::{Error, IoSlice, IoSliceMut, SeekFrom};
+use futures::io::{IoSlice, IoSliceMut, SeekFrom};
 use futures::task::{Context, Poll};
 use futures::Future;
 use libc::{flock, EBADF, EINTR, ENOLCK, EWOULDBLOCK, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN};
@@ -12,6 +12,9 @@ use libc::{flock, EBADF, EINTR, ENOLCK, EWOULDBLOCK, LOCK_EX, LOCK_NB, LOCK_SH, 
 use crate::fs::errors::LockError;
 
 pub trait FdLock: AsRawFd + Unpin + Sized {
+  /// Acquires an exclusive lock to the file descriptor.
+  ///
+  /// The underlying future will run on a loop until the lock is acquired.
   fn lock_exclusive(self) -> FutureFdLock<Self> {
     FutureFdLock {
       inner_fd: Some(self),
@@ -19,6 +22,9 @@ pub trait FdLock: AsRawFd + Unpin + Sized {
     }
   }
 
+  /// Acquires a shared lock to the file descriptor.
+  ///
+  /// The underlying future will run on a loop until the lock is acquired.
   fn lock_shared(self) -> FutureFdLock<Self> {
     FutureFdLock {
       inner_fd: Some(self),
@@ -31,7 +37,7 @@ impl<T: AsRawFd + Unpin> FdLock for T {}
 
 pub trait SyncFdLock: AsRawFd + Sized {
   fn try_lock_exclusive(self) -> Result<FdAdvisoryLock<Self>, LockError> {
-    try_lock(&self, LOCK_SH)?;
+    try_lock(&self, LOCK_EX)?;
     Ok(FdAdvisoryLock { fd: self })
   }
 
@@ -91,6 +97,29 @@ pub struct FdAdvisoryLock<T: AsRawFd> {
   fd: T,
 }
 
+impl<T: AsRawFd> FdAdvisoryLock<T> {
+  pub fn unlock(self) -> T {
+    let mut no_drop_self = ManuallyDrop::new(self);
+    no_drop_self.internal_unlock();
+
+    // SAFETY: `self` is effectivelly dropped at this point.
+    let inner = std::mem::replace(&mut no_drop_self.fd, unsafe { std::mem::zeroed() });
+    inner
+  }
+
+  fn internal_unlock(&self) {
+    if unsafe { flock(self.fd.as_raw_fd(), LOCK_UN | LOCK_NB) } != 0 {
+      panic!("Could not unlock the file descriptor");
+    }
+  }
+}
+
+impl<T: AsRawFd> Into<std::fs::File> for FdAdvisoryLock<T> {
+  fn into(self) -> std::fs::File {
+    unsafe { std::fs::File::from_raw_fd(self.fd.as_raw_fd()) }
+  }
+}
+
 impl<T: AsRawFd> Deref for FdAdvisoryLock<T> {
   type Target = T;
 
@@ -107,9 +136,7 @@ impl<T: AsRawFd> DerefMut for FdAdvisoryLock<T> {
 
 impl<T: AsRawFd> Drop for FdAdvisoryLock<T> {
   fn drop(&mut self) {
-    if unsafe { flock(self.fd.as_raw_fd(), LOCK_UN | LOCK_NB) } != 0 {
-      panic!("Could not unlock the file descriptor");
-    }
+    self.internal_unlock()
   }
 }
 
@@ -163,65 +190,16 @@ impl<T: AsRawFd + std::io::Seek> std::io::Seek for FdAdvisoryLock<T> {
   }
 }
 
-impl<T: AsRawFd + tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FdAdvisoryLock<T> {
-  fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<tokio::io::Result<usize>> {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_read(cx, buf)
-  }
-
-  fn poll_read_buf<B: BufMut>(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut B) -> Poll<tokio::io::Result<usize>>
-  where
-    Self: Sized,
-  {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_read_buf(cx, buf)
-  }
-}
-
-impl<T: AsRawFd + tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for FdAdvisoryLock<T> {
-  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_write(cx, buf)
-  }
-
-  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_flush(cx)
-  }
-
-  fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_shutdown(cx)
-  }
-
-  fn poll_write_buf<B: Buf>(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut B) -> Poll<Result<usize, Error>>
-  where
-    Self: Sized,
-  {
-    let me = self.get_mut();
-    let fd = unsafe { std::pin::Pin::new_unchecked(&mut me.fd) };
-
-    fd.poll_write_buf(cx, buf)
-  }
-}
-
 #[cfg(test)]
 mod test {
   use std::fs::File;
+  use std::process::exit;
 
   use libc::{LOCK_EX, LOCK_SH};
+  use nix::sys::wait::{waitpid, WaitStatus};
+  use nix::unistd::{fork, ForkResult};
 
-  use crate::fs::FdLock;
+  use crate::fs::{FdLock, SyncFdLock};
 
   use super::{try_lock, LockError};
 
@@ -328,5 +306,57 @@ mod test {
 
     assert!(acquire_exclusive.await.is_ok());
     assert!(acquire_shared.await.is_ok());
+  }
+
+  #[test]
+  fn should_drop_when_converted_into_a_file() -> std::io::Result<()> {
+    let fd_a = tempfile::NamedTempFile::new().unwrap();
+    let path = fd_a.path().to_path_buf();
+
+    let res_a = fd_a.try_lock_exclusive();
+
+    assert!(res_a.is_ok());
+
+    match fork() {
+      Ok(ForkResult::Child) => {
+        let fd_b = File::open(path).unwrap();
+        let res_a = fd_b.try_lock_exclusive();
+
+        if res_a.is_ok() {
+          exit(0);
+        } else {
+          exit(1);
+        }
+      }
+      Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
+        Ok(WaitStatus::Exited(_, status)) => assert_eq!(1, status),
+        Ok(_) => assert!(false),
+        Err(err) => panic!("[main] waitpid() failed: {}", err),
+      },
+      _ => assert!(false),
+    }
+
+    let _dropped = res_a.unwrap().unlock();
+
+    match fork() {
+      Ok(ForkResult::Child) => {
+        let fd_b = File::open(path).unwrap();
+        let res_a = fd_b.try_lock_exclusive();
+
+        if res_a.is_ok() {
+          exit(0);
+        } else {
+          exit(1);
+        }
+      }
+      Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
+        Ok(WaitStatus::Exited(_, status)) => assert_eq!(0, status),
+        Ok(_) => assert!(false),
+        Err(err) => panic!("[main] waitpid() failed: {}", err),
+      },
+      _ => assert!(false),
+    }
+
+    Ok(())
   }
 }
