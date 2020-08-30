@@ -8,6 +8,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::fs::OpenOptions;
 
+use crate::compressor::compress;
 use crate::fs::FdLock;
 use crate::index::Index;
 use crate::metadata::{ChannelMetadata, WireFormat};
@@ -42,7 +43,10 @@ pub struct Sender<T: Serialize + ?Sized> {
   index: Index,
 
   /// The current roll cycle.
-  current_cycle: i64,
+  current_cycle_timestamp: i64,
+
+  /// The current roll cycle offset.
+  current_cycle_offset: i64,
 
   data_type: PhantomData<T>,
 }
@@ -73,7 +77,8 @@ impl<T: Serialize + ?Sized> Sender<T> {
       hot_storage_path: hot_storage_path.as_ref().to_path_buf(),
       metadata,
       index,
-      current_cycle: 0,
+      current_cycle_timestamp: 0,
+      current_cycle_offset: 0,
       data_type: Default::default(),
 
       data: MmapMut::map_anon(1)?,
@@ -86,7 +91,7 @@ impl<T: Serialize + ?Sized> Sender<T> {
 
   pub async fn send(&mut self, data: &T) -> Result<(), SenderError> {
     // Checks and updates the current cycle
-    if self.current_cycle < self.metadata.roll_cycle.current_cycle() {
+    if self.current_cycle_timestamp < self.metadata.roll_cycle.current_cycle() {
       self.update_data_file().await?;
     }
 
@@ -100,8 +105,18 @@ impl<T: Serialize + ?Sized> Sender<T> {
     // Acquire the next index position
     let (element_index, write_cursor_position) = self.reserve_writeable_slot(element_size).await?;
 
+    // Detect offset. If there was a change in cycles, we set the offset to prevent writing in the
+    // middle of the file.
+    if element_index > 0
+      && self.index[element_index - 1].cycle_timestamp.load(Ordering::SeqCst) < self.current_cycle_timestamp
+    {
+      self.current_cycle_offset = self.index[element_index - 1]
+        .last_cursor_position
+        .load(Ordering::SeqCst);
+    }
+
     // Check whether there's any space left in the data file
-    while !self.has_enough_memory_available(write_cursor_position, element_size) {
+    while !self.has_enough_memory_available(write_cursor_position - self.current_cycle_offset, element_size) {
       self.expand_memory().await?;
     }
 
@@ -109,7 +124,10 @@ impl<T: Serialize + ?Sized> Sender<T> {
     // element. Atomic semantics also guarantee that the space to be written was already
     // reserved in `self.reserve_writeable_slot(element_size: u64)`.
     unsafe {
-      let target_ptr = self.data.as_mut_ptr().add(write_cursor_position as usize);
+      let target_ptr = self
+        .data
+        .as_mut_ptr()
+        .add((write_cursor_position - self.current_cycle_offset) as usize);
       let data_slice = std::slice::from_raw_parts_mut(target_ptr, element_size as usize);
 
       match self.metadata.wire_format {
@@ -123,14 +141,14 @@ impl<T: Serialize + ?Sized> Sender<T> {
     // Commit operation by storing the current cycle
     self.index[element_index]
       .cycle_timestamp
-      .store(self.current_cycle, Ordering::SeqCst);
+      .store(self.current_cycle_timestamp, Ordering::SeqCst);
 
     Ok(())
   }
 
   async fn update_data_file(&mut self) -> Result<(), SenderError> {
     // Update the current cycle
-    self.current_cycle = self.metadata.roll_cycle.current_cycle();
+    self.current_cycle_timestamp = self.metadata.roll_cycle.current_cycle();
 
     let data_file = OpenOptions::new()
       .read(true)
@@ -139,7 +157,7 @@ impl<T: Serialize + ?Sized> Sender<T> {
       .open(
         self
           .hot_storage_path
-          .join(&self.metadata.roll_cycle.data_file_name(self.current_cycle)),
+          .join(&self.metadata.roll_cycle.data_file_name(self.current_cycle_timestamp)),
       )
       .await?;
 
@@ -151,10 +169,21 @@ impl<T: Serialize + ?Sized> Sender<T> {
     let data_file = locked_data_file.unlock().into_std().await;
     self.data = unsafe { MmapOptions::new().map_mut(&data_file)? };
 
+    // Try to compress uncompressed closed files
+    tokio::spawn(compress(
+      self.hot_storage_path.clone(),
+      self.metadata.compression_format.clone(),
+    ));
+
     Ok(())
   }
 
   async fn reserve_writeable_slot(&mut self, element_size: u64) -> Result<(u64, i64), SenderError> {
+    // Look at the last element of the index.
+    // If the index is empty, the cursor position is set to zero.
+    // If the index is not empty, the cursor will be zero if the previous cycle is less than the current
+    // cycle, otherwise, it will be set as that position.
+
     loop {
       self.index.expand().await?;
 
@@ -177,19 +206,6 @@ impl<T: Serialize + ?Sized> Sender<T> {
         // Commit succeeded. Increase the index size.
         self.index.increment_size(Ordering::SeqCst);
 
-        // #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        // unsafe {
-        //   // Write back the cache lines if available in the target platform.
-        //   crate::atomic::x86_64::clwb(self.index.as_ptr().cast::<AtomicU64>());
-        //   crate::atomic::x86_64::clwb(
-        //     self
-        //       .index
-        //       .as_ptr()
-        //       .cast::<AtomicI64>()
-        //       .add(current_index_position as usize),
-        //   );
-        // }
-
         return Ok((current_index_size, starting_cursor_position.abs()));
       }
     }
@@ -207,7 +223,7 @@ impl<T: Serialize + ?Sized> Sender<T> {
       .open(
         self
           .hot_storage_path
-          .join(&self.metadata.roll_cycle.data_file_name(self.current_cycle)),
+          .join(&self.metadata.roll_cycle.data_file_name(self.current_cycle_timestamp)),
       )
       .await?;
 

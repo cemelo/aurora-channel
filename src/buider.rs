@@ -145,7 +145,7 @@ impl ChannelBuilder {
       .create(true)
       .write(true)
       .read(true)
-      .open(self.hot_storage_path.join(crate::metadata::METADATA_FILE_NAME))
+      .open(self.hot_storage_path.join(crate::METADATA_FILE_NAME))
       .await?;
 
     let mut metadata_file = metadata_file.lock_exclusive().await?;

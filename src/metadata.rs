@@ -4,7 +4,7 @@ use chrono::{Datelike, Local, NaiveDateTime, Timelike};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const METADATA_FILE_NAME: &str = "metadata.auq";
+use crate::DATA_FILE_EXTENSION;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChannelMetadata {
@@ -46,7 +46,7 @@ impl RollCycle {
       RollCycle::Month => now.format("%Y%m"),
     };
 
-    format!("{}.aqd", formatted_date_time)
+    format!("{}.{}", formatted_date_time, DATA_FILE_EXTENSION)
   }
 
   pub fn current_cycle(&self) -> i64 {
@@ -89,6 +89,22 @@ impl RollCycle {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum CompressionFormat {
   Uncompressed = 0,
+  #[cfg(feature = "compression-lz4")]
+  LZ4 = 1,
+  #[cfg(feature = "compression-snappy")]
+  Snappy = 2,
+}
+
+impl CompressionFormat {
+  pub fn extension(&self) -> String {
+    match self {
+      CompressionFormat::Uncompressed => DATA_FILE_EXTENSION.into(),
+      #[cfg(feature = "compression-lz4")]
+      CompressionFormat::LZ4 => format!("{}.lz4", DATA_FILE_EXTENSION),
+      #[cfg(feature = "compression-snappy")]
+      CompressionFormat::Snappy => format!("{}.sz", DATA_FILE_EXTENSION),
+    }
+  }
 }
 
 impl TryFrom<u16> for CompressionFormat {
@@ -97,6 +113,10 @@ impl TryFrom<u16> for CompressionFormat {
   fn try_from(value: u16) -> Result<Self, Self::Error> {
     match value {
       0 => Ok(CompressionFormat::Uncompressed),
+      #[cfg(feature = "compression-lz4")]
+      1 => Ok(CompressionFormat::LZ4),
+      #[cfg(feature = "compression-snappy")]
+      2 => Ok(CompressionFormat::Snappy),
       _ => Err(ConversionError::EnumConversionError),
     }
   }

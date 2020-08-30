@@ -1,12 +1,14 @@
 use std::error::Error;
 
-use aurora_channel::{ChannelBuilder, WireFormat};
+use aurora_channel::{ChannelBuilder, WireFormat, RollCycle, CompressionFormat};
+use tokio::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-  let tempdir = tempfile::tempdir()?;
-  let channel = ChannelBuilder::new(tempdir.path())
-    .wire_format(WireFormat::Bincode)
+  let channel = ChannelBuilder::new("/tmp/channel")
+    .wire_format(WireFormat::Json)
+    .roll_cycle(RollCycle::Second)
+    .compression(CompressionFormat::LZ4)
     .build::<String>()
     .await?;
 
@@ -17,16 +19,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     loop {
       match receiver.recv().await.unwrap() {
         None => {}
+        Some(message) if message == "exit" => {
+          println!("{}", message);
+          break;
+        },
         Some(message) => {
           println!("{}", message);
-          break
         },
       }
     }
   });
 
   let sending_task = tokio::spawn(async move {
-    sender.send(&"this is a message".to_string()).await.unwrap();
+    // sender.send(&"Message: 1".to_string()).await.unwrap();
+    // sender.send(&"Message: 2".to_string()).await.unwrap();
+    // sender.send(&"Message: 3".to_string()).await.unwrap();
+    // tokio::time::delay_for(Duration::from_secs(1)).await;
+    //
+    // sender.send(&"Message: 4".to_string()).await.unwrap();
+    // sender.send(&"Message: 5".to_string()).await.unwrap();
+    // sender.send(&"Message: 6".to_string()).await.unwrap();
+    // tokio::time::delay_for(Duration::from_secs(1)).await;
+    //
+    // sender.send(&"Message: 7".to_string()).await.unwrap();
+    // sender.send(&"Message: 8".to_string()).await.unwrap();
+    // sender.send(&"Message: 9".to_string()).await.unwrap();
+    // tokio::time::delay_for(Duration::from_secs(1)).await;
+    //
+    // sender.send(&"exit".to_string()).await.unwrap();
+    // tokio::time::delay_for(Duration::from_secs(1)).await;
   });
 
   let (res_a, res_b) = futures::future::join(receiving_task, sending_task).await;

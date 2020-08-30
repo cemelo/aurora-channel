@@ -9,6 +9,7 @@ use crate::receiver::Receiver;
 use crate::receiver::ReceiverError;
 use crate::sender::Sender;
 use crate::sender::SenderError;
+use std::fmt::Debug;
 
 pub struct Channel<T: Serialize + DeserializeOwned + ?Sized> {
   pub(crate) hot_storage_path: PathBuf,
@@ -20,7 +21,7 @@ pub struct Channel<T: Serialize + DeserializeOwned + ?Sized> {
   pub(crate) element_type: PhantomData<T>,
 }
 
-impl<T: Serialize + DeserializeOwned + ?Sized> Channel<T> {
+impl<T: Serialize + DeserializeOwned + Debug + ?Sized> Channel<T> {
   pub async fn acquire_sender(&self) -> Result<Sender<T>, SenderError> {
     Ok(Sender::new(&self.hot_storage_path, self.metadata.clone()).await?)
   }
