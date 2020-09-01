@@ -31,23 +31,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
   });
 
   let sending_task = tokio::spawn(async move {
-    // sender.send(&"Message: 1".to_string()).await.unwrap();
-    // sender.send(&"Message: 2".to_string()).await.unwrap();
-    // sender.send(&"Message: 3".to_string()).await.unwrap();
-    // tokio::time::delay_for(Duration::from_secs(1)).await;
-    //
-    // sender.send(&"Message: 4".to_string()).await.unwrap();
-    // sender.send(&"Message: 5".to_string()).await.unwrap();
-    // sender.send(&"Message: 6".to_string()).await.unwrap();
-    // tokio::time::delay_for(Duration::from_secs(1)).await;
-    //
-    // sender.send(&"Message: 7".to_string()).await.unwrap();
-    // sender.send(&"Message: 8".to_string()).await.unwrap();
-    // sender.send(&"Message: 9".to_string()).await.unwrap();
-    // tokio::time::delay_for(Duration::from_secs(1)).await;
-    //
-    // sender.send(&"exit".to_string()).await.unwrap();
-    // tokio::time::delay_for(Duration::from_secs(1)).await;
+    sender.send(&"Message: 1".to_string()).await.unwrap();
+    sender.send(&"Message: 2".to_string()).await.unwrap();
+    sender.send(&"Message: 3".to_string()).await.unwrap();
+    tokio::time::delay_for(Duration::from_secs(1)).await;
+
+    sender.send(&"Message: 4".to_string()).await.unwrap();
+    sender.send(&"Message: 5".to_string()).await.unwrap();
+    sender.send(&"Message: 6".to_string()).await.unwrap();
+    tokio::time::delay_for(Duration::from_secs(1)).await;
+
+    sender.send(&"Message: 7".to_string()).await.unwrap();
+    sender.send(&"Message: 8".to_string()).await.unwrap();
+    sender.send(&"Message: 9".to_string()).await.unwrap();
+    tokio::time::delay_for(Duration::from_secs(1)).await;
+
+    sender.send(&"exit".to_string()).await.unwrap();
+    tokio::time::delay_for(Duration::from_secs(1)).await;
   });
 
   let (res_a, res_b) = futures::future::join(receiving_task, sending_task).await;

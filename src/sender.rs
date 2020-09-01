@@ -14,20 +14,29 @@ use crate::index::Index;
 use crate::metadata::{ChannelMetadata, WireFormat};
 
 /// Sending half of a file backed channel.
+///
 /// May be used from a single thread only. Messages can be sent with [`send`][Sender::send].
 ///
-/// Index file format:
+/// # Examples
 ///
-/// ```text
-/// 0                7
-/// +-----------------+
-/// |   Index Size    |
-/// +-----------------+
-/// |      Cycle      |
-/// +-----------------+
-/// | Cursor Position |
-/// +-----------------+
-///         ...
+/// ```rust
+/// use aurora_channel::*;
+/// use std::error::Error;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn Error>> {
+///   let channel = ChannelBuilder::new("/tmp/channel")
+///     .wire_format(WireFormat::Bincode)
+///     .roll_cycle(RollCycle::Second)
+///     .compression(CompressionFormat::Uncompressed)
+///     .build::<u32>()
+///     .await?;
+///
+///   let mut sender = channel.acquire_sender().await?;
+///   sender.send(&1).await?;
+///
+///   Ok(())
+/// }
 /// ```
 pub struct Sender<T: Serialize + ?Sized> {
   /// The hot storage path.
@@ -46,7 +55,7 @@ pub struct Sender<T: Serialize + ?Sized> {
   current_cycle_timestamp: i64,
 
   /// The current roll cycle offset.
-  current_cycle_offset: i64,
+  write_cursor_position: u64,
 
   data_type: PhantomData<T>,
 }
@@ -55,16 +64,21 @@ pub struct Sender<T: Serialize + ?Sized> {
 pub enum SenderError {
   #[error("I/O error")]
   IoError(#[from] std::io::Error),
+
   #[error("File locking error")]
   LockError(#[from] crate::fs::LockError),
+
   #[error("Indexing error")]
   IndexError(#[from] crate::index::IndexError),
+
   #[cfg(feature = "format-bincode")]
   #[error("Bincode serialization error")]
   BincodeSerializationError(#[from] bincode::Error),
+
   #[cfg(feature = "format-json")]
   #[error("Json serialization error")]
   JsonSerializationError(#[from] serde_json::Error),
+
   #[error("Unknown error")]
   UnknownError(#[from] Box<dyn Error>),
 }
@@ -78,7 +92,7 @@ impl<T: Serialize + ?Sized> Sender<T> {
       metadata,
       index,
       current_cycle_timestamp: 0,
-      current_cycle_offset: 0,
+      write_cursor_position: 0,
       data_type: Default::default(),
 
       data: MmapMut::map_anon(1)?,
@@ -89,8 +103,40 @@ impl<T: Serialize + ?Sized> Sender<T> {
     Ok(sender)
   }
 
-  pub async fn send(&mut self, data: &T) -> Result<(), SenderError> {
-    // Checks and updates the current cycle
+  /// Attempts to enqueue a value into the journal, which can be consumed by the [`Receiver`]
+  /// handles.
+  ///
+  /// A successful send occurs when the sender handle is able to fully commit a write to the
+  /// journal.
+  ///
+  /// # Write Semantics
+  ///
+  /// A write to the journal is composed of three phases:
+  ///
+  /// - index slot acquisition;
+  /// - data serialization and persistence;
+  /// - write commitment.
+  ///
+  ///
+  ///
+  /// Values sent through this interface are always appended to the file corresponding to the most
+  /// current cycle. This means the handle will first check whether it is referring to the current
+  /// cycle and move to another cycle if necessary. As a consequence, it's possible that a write
+  /// to the journal will only be committed after the cycle completed.
+  ///
+  /// # Return
+  ///
+  /// On success, the number of bytes written to the journal is returned.
+  ///
+  /// # Note
+  ///
+  /// A return value of `Ok` **always** means the journal was updated. However, it does not mean
+  /// the value will be observed by any or all of the active [`Receiver`] handles. [`Receiver`]
+  /// handles may be dropped before receiving the sent message.
+  ///
+  /// [`Receiver`]: crate::Receiver
+  pub async fn send(&mut self, data: &T) -> Result<u64, SenderError> {
+    // Checks whether the current cycle was changed and update the memory mapped file accordingly.
     if self.current_cycle_timestamp < self.metadata.roll_cycle.current_cycle() {
       self.update_data_file().await?;
     }
@@ -102,21 +148,11 @@ impl<T: Serialize + ?Sized> Sender<T> {
       WireFormat::Json => serde_json::ser::to_string(data)?.len() as u64,
     };
 
-    // Acquire the next index position
+    // Acquire a position in the index.
     let (element_index, write_cursor_position) = self.reserve_writeable_slot(element_size).await?;
 
-    // Detect offset. If there was a change in cycles, we set the offset to prevent writing in the
-    // middle of the file.
-    if element_index > 0
-      && self.index[element_index - 1].cycle_timestamp.load(Ordering::SeqCst) < self.current_cycle_timestamp
-    {
-      self.current_cycle_offset = self.index[element_index - 1]
-        .last_cursor_position
-        .load(Ordering::SeqCst);
-    }
-
     // Check whether there's any space left in the data file
-    while !self.has_enough_memory_available(write_cursor_position - self.current_cycle_offset, element_size) {
+    while !self.has_enough_memory_available(write_cursor_position, element_size) {
       self.expand_memory().await?;
     }
 
@@ -127,7 +163,7 @@ impl<T: Serialize + ?Sized> Sender<T> {
       let target_ptr = self
         .data
         .as_mut_ptr()
-        .add((write_cursor_position - self.current_cycle_offset) as usize);
+        .add((write_cursor_position - self.write_cursor_position) as usize);
       let data_slice = std::slice::from_raw_parts_mut(target_ptr, element_size as usize);
 
       match self.metadata.wire_format {
@@ -143,7 +179,7 @@ impl<T: Serialize + ?Sized> Sender<T> {
       .cycle_timestamp
       .store(self.current_cycle_timestamp, Ordering::SeqCst);
 
-    Ok(())
+    Ok(element_size)
   }
 
   async fn update_data_file(&mut self) -> Result<(), SenderError> {
@@ -178,40 +214,56 @@ impl<T: Serialize + ?Sized> Sender<T> {
     Ok(())
   }
 
-  async fn reserve_writeable_slot(&mut self, element_size: u64) -> Result<(u64, i64), SenderError> {
+  async fn reserve_writeable_slot(&mut self, element_size: u64) -> Result<(u64, u64), SenderError> {
     // Look at the last element of the index.
     // If the index is empty, the cursor position is set to zero.
     // If the index is not empty, the cursor will be zero if the previous cycle is less than the current
     // cycle, otherwise, it will be set as that position.
 
-    loop {
+    // Compare-and-swap loop responsible for acquiring a position in the index
+    'cas: loop {
       self.index.expand().await?;
 
       let current_index_size = self.index.len();
       let current_index_element = &self.index[current_index_size];
 
-      let starting_cursor_position = if current_index_size == 0 {
-        0
-      } else {
+      let mut starting_cursor_position = 0;
+      if !self.index.is_empty() {
         let prev_index_element = &self.index[current_index_size - 1];
-        prev_index_element.last_cursor_position.load(Ordering::SeqCst).abs()
+        let prev_cycle_timestamp = prev_index_element.cycle_timestamp.load(Ordering::SeqCst).abs();
+
+        // Ensures the writing cycle is always greater than the committed cycle
+        if prev_cycle_timestamp > self.current_cycle_timestamp {
+          self.update_data_file().await?;
+          continue 'cas;
+        }
+
+        // If the cycle is the same, we increase the cursor, otherwise we keep it as zero
+        if prev_cycle_timestamp == self.current_cycle_timestamp {
+          starting_cursor_position = prev_index_element.last_cursor_position.load(Ordering::SeqCst);
+        }
       };
 
       if current_index_element.last_cursor_position.compare_and_swap(
         0,
-        starting_cursor_position + element_size as i64,
+        starting_cursor_position + element_size,
         Ordering::SeqCst,
       ) == 0
       {
-        // Commit succeeded. Increase the index size.
+        // Slot acquisition succeeded. Increase the index size.
         self.index.increment_size(Ordering::SeqCst);
 
-        return Ok((current_index_size, starting_cursor_position.abs()));
+        // Store the cycle timestamp in with negative bit set to indicate an uncommitted operation.
+        current_index_element
+          .cycle_timestamp
+          .store(-self.current_cycle_timestamp, Ordering::SeqCst);
+
+        return Ok((current_index_size, starting_cursor_position));
       }
     }
   }
 
-  fn has_enough_memory_available(&self, position: i64, element_size: u64) -> bool {
+  fn has_enough_memory_available(&self, position: u64, element_size: u64) -> bool {
     self.data.len() as u64 >= position as u64 + element_size
   }
 

@@ -1,5 +1,7 @@
 use std::error::Error;
+use std::fmt::Debug;
 use std::io::Read;
+use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -13,7 +15,6 @@ use crate::fs::LockError;
 use crate::index::Index;
 use crate::metadata::{ChannelMetadata, WireFormat};
 use crate::CompressionFormat;
-use std::fmt::Debug;
 
 // TODO create common InternalRead interface that will read files depending on whether they are
 // compressed or not
@@ -30,9 +31,10 @@ pub struct Receiver<T: DeserializeOwned + Debug> {
   cool_storage_path: Option<PathBuf>,
   cold_storage_path: Option<PathBuf>,
 
-  current_index_position: i64,
+  current_index_position: u64,
   current_cycle_timestamp: i64,
-  current_cycle_offset: i64,
+
+  read_cursor_position: u64,
 
   element_type: PhantomData<T>,
 }
@@ -74,65 +76,39 @@ impl<T: DeserializeOwned + Debug> Receiver<T> {
       hot_storage_path: hot_storage_path.as_ref().to_path_buf(),
       cool_storage_path: cool_storage_path.map(|p| p.as_ref().to_path_buf()),
       cold_storage_path: cold_storage_path.map(|p| p.as_ref().to_path_buf()),
-      current_index_position: -1,
+      current_index_position: 0,
       current_cycle_timestamp: 0,
-      current_cycle_offset: 0,
+      read_cursor_position: 0,
       element_type: Default::default(),
     })
   }
 
   pub async fn recv(&mut self) -> Result<Option<T>, ReceiverError> {
-    let next_index_position = (self.current_index_position + 1) as u64;
-    if self.index.len() < next_index_position + 1 {
+    // Check whether there's new data available to be read.
+    if self.index.len() < self.current_index_position + 1 {
       return Ok(None);
     }
 
     self.refresh_index().await?;
 
-    let (next_cycle_timestamp, last_cursor_position) = {
-      let index_element = &self.index[next_index_position];
-      (
-        index_element.cycle_timestamp.load(Ordering::SeqCst),
-        index_element.last_cursor_position.load(Ordering::SeqCst),
-      )
-    };
+    let next_cycle_timestamp = self.index[self.current_index_position]
+      .cycle_timestamp
+      .load(Ordering::SeqCst);
 
-    if next_cycle_timestamp == 0 {
-      // Stream ended or element not yet committed.
+    // Stream ended or element not yet committed
+    if next_cycle_timestamp <= 0 {
       return Ok(None);
     }
 
-    if (self.compressed_reader.is_none() && self.data.len() < last_cursor_position.abs() as usize)
-      || next_cycle_timestamp != self.current_cycle_timestamp
-    {
+    // Check whether we need to map the next journal file
+    if next_cycle_timestamp != self.current_cycle_timestamp {
       self.current_cycle_timestamp = next_cycle_timestamp;
+      self.read_cursor_position = 0;
       self.map_data_file().await?;
     }
 
-    let index_element = &self.index[next_index_position];
-
-    // Detect offset. If there was a change in cycles, we set the offset to prevent writing in the
-    // middle of the file.
-    if next_index_position > 0
-      && self.index[next_index_position - 1]
-        .cycle_timestamp
-        .load(Ordering::SeqCst)
-        < self.current_cycle_timestamp
-    {
-      self.current_cycle_offset = self.index[next_index_position - 1]
-        .last_cursor_position
-        .load(Ordering::SeqCst);
-    }
-
-    let read_cursor_position = if next_index_position == 0 {
-      0
-    } else {
-      (&self.index[self.current_index_position])
-        .last_cursor_position
-        .load(Ordering::SeqCst)
-    };
-
-    let element_size = index_element.last_cursor_position.load(Ordering::SeqCst) - read_cursor_position;
+    let index_element = &self.index[self.current_index_position];
+    let element_size = index_element.last_cursor_position.load(Ordering::SeqCst) - self.read_cursor_position;
 
     let data: T = if let Some(ref mut reader) = self.compressed_reader {
       match self.metadata.wire_format {
@@ -143,10 +119,7 @@ impl<T: DeserializeOwned + Debug> Receiver<T> {
       }
     } else {
       let reader = unsafe {
-        let target_ptr = self
-          .data
-          .as_ptr()
-          .add((read_cursor_position - self.current_cycle_offset) as usize);
+        let target_ptr = self.data.as_ptr().add(self.read_cursor_position as usize);
         std::slice::from_raw_parts(target_ptr, element_size as usize)
       };
 
@@ -158,7 +131,8 @@ impl<T: DeserializeOwned + Debug> Receiver<T> {
       }
     };
 
-    self.current_index_position = next_index_position as i64;
+    self.current_index_position.add_assign(1);
+    self.read_cursor_position.add_assign(element_size);
 
     Ok(Some(data))
   }

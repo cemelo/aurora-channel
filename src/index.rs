@@ -27,7 +27,7 @@ pub enum IndexError {
 #[repr(C)]
 pub struct IndexElement {
   pub cycle_timestamp: AtomicI64,
-  pub last_cursor_position: AtomicI64,
+  pub last_cursor_position: AtomicU64,
 }
 
 impl Index {
@@ -54,6 +54,10 @@ impl Index {
       block_size,
       data: index_data,
     })
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
   }
 
   pub fn len(&self) -> u64 {
