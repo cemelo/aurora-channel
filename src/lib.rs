@@ -18,8 +18,8 @@
 
 pub use crate::buider::{ChannelBuilder, ChannelConfigError};
 pub use crate::metadata::{CompressionFormat, ConversionError, RollCycle, WireFormat};
-pub use crate::receiver::Receiver;
-pub use crate::sender::Sender;
+pub use crate::receiver::{Receiver, ReceiverError};
+pub use crate::sender::{Sender, SenderError};
 
 mod buider;
 mod channel;
