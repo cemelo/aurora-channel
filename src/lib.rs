@@ -16,7 +16,7 @@
 //!
 //! The channel implementation is based on the following concepts...
 
-pub use crate::buider::ChannelBuilder;
+pub use crate::buider::{ChannelBuilder, ChannelConfigError};
 pub use crate::metadata::{CompressionFormat, ConversionError, RollCycle, WireFormat};
 pub use crate::receiver::Receiver;
 pub use crate::sender::Sender;
