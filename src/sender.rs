@@ -208,7 +208,7 @@ impl<T: Serialize + ?Sized> Sender<T> {
     // Try to compress uncompressed closed files
     tokio::spawn(compress(
       self.hot_storage_path.clone(),
-      self.metadata.compression_format.clone(),
+      self.metadata.clone(),
     ));
 
     Ok(())

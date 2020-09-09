@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::fs::{FdLock, SyncFdLock};
+use crate::metadata::ChannelMetadata;
 use crate::{CompressionFormat, DATA_FILE_EXTENSION};
 
 #[derive(Error, Debug)]
@@ -19,22 +20,31 @@ pub enum CompressorError {
   JoinError(#[from] tokio::task::JoinError),
 }
 
-pub async fn compress(hot_storage_path: PathBuf, format: CompressionFormat) -> Result<(), CompressorError> {
-  if let CompressionFormat::Uncompressed = format {
+#[tracing::instrument(name = "Compression", skip(hot_storage_path, metadata))]
+pub async fn compress(hot_storage_path: PathBuf, metadata: ChannelMetadata) -> Result<(), CompressorError> {
+  if let CompressionFormat::Uncompressed = metadata.compression_format {
     return Ok(());
   }
 
   // Look up for uncompressed files
   let mut dir_contents = tokio::fs::read_dir(&hot_storage_path).await?;
   while let Some(entry) = dir_contents.next_entry().await? {
+
+    // Skip file corresponding to the current cycle
+    if let Some(filename) = entry.path().file_name().and_then(|f| f.to_str()) {
+      if filename == metadata.roll_cycle.data_file_name(metadata.roll_cycle.current_cycle()) {
+        continue;
+      }
+    }
+
     match entry.path().extension() {
       Some(ext) if ext == OsStr::new(DATA_FILE_EXTENSION) => {
         let mut source = OpenOptions::new().read(true).open(entry.path())?;
 
         let mut compressed_file_path = entry.path().clone();
-        compressed_file_path.set_extension(format.extension());
+        compressed_file_path.set_extension(metadata.compression_format.extension());
 
-        log::debug!("Compressing {:?} using {:?}", entry.path(), format);
+        tracing::debug!("Compressing {:?} using {:?}", entry.path(), metadata.compression_format);
 
         let compressed_file = OpenOptions::new()
           .read(true)
@@ -47,7 +57,7 @@ pub async fn compress(hot_storage_path: PathBuf, format: CompressionFormat) -> R
         if let Ok(locked_compressed_file) = compressed_file.try_lock_exclusive() {
           // Read and compress target
 
-          let (source, _) = match format {
+          let (source, _) = match metadata.compression_format {
             #[cfg(feature = "compression-lz4")]
             CompressionFormat::LZ4 => {
               tokio::task::spawn_blocking(move || {
@@ -57,7 +67,7 @@ pub async fn compress(hot_storage_path: PathBuf, format: CompressionFormat) -> R
                   .level(8)
                   .build(locked_compressed_file)?;
 
-                log::debug!("Encoding source data.");
+                tracing::debug!("Encoding source data.");
                 std::io::copy(&mut source, &mut encoder)?;
 
                 let (lock, result) = encoder.finish();
@@ -71,7 +81,7 @@ pub async fn compress(hot_storage_path: PathBuf, format: CompressionFormat) -> R
               tokio::task::spawn_blocking(move || {
                 let mut encoder = snap::write::FrameEncoder::new(locked_compressed_file);
 
-                log::debug!("Encoding source data.");
+                tracing::debug!("Encoding source data.");
                 std::io::copy(&mut source, &mut encoder)?;
 
                 encoder
@@ -87,7 +97,7 @@ pub async fn compress(hot_storage_path: PathBuf, format: CompressionFormat) -> R
 
           // Compression completed. Delete original file.
           if let Ok(_) = source.lock_exclusive().await {
-            log::debug!("Removing source file {:?}", entry.path());
+            tracing::debug!("Removing source file {:?}", entry.path());
             tokio::fs::remove_file(entry.path()).await?;
           }
         }

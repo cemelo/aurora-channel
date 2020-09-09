@@ -55,6 +55,8 @@ pub enum ReceiverError {
   #[cfg(feature = "format-json")]
   #[error("Json deserialization error")]
   JsonDeserializationError(#[from] serde_json::Error),
+  #[error("Deserialization error")]
+  DeserializationError(String, String),
   #[error("Unknown error")]
   UnknownError(#[from] Box<dyn Error>),
 }
@@ -113,9 +115,32 @@ impl<T: DeserializeOwned + Debug> Receiver<T> {
     let data: T = if let Some(ref mut reader) = self.compressed_reader {
       match self.metadata.wire_format {
         #[cfg(feature = "format-bincode")]
-        WireFormat::Bincode => bincode::deserialize_from(reader.take(element_size as u64))?,
+        WireFormat::Bincode => {
+          let source = reader.take(element_size);
+          bincode::deserialize_from(source)
+            .map_err(|e| {
+              let mut collected_source = vec![0u8; element_size as usize];
+              reader.read_exact(&mut collected_source).unwrap();
+
+              ReceiverError::DeserializationError(
+                format!("{:?}", e),
+                unsafe { String::from_utf8_unchecked(collected_source) }
+              )
+            })?
+        },
         #[cfg(feature = "format-json")]
-        WireFormat::Json => serde_json::de::from_reader(reader.take(element_size as u64))?,
+        WireFormat::Json => {
+          let source = reader.take(element_size);
+          serde_json::de::from_reader(source).map_err(|e| {
+            let mut collected_source = vec![0u8; element_size as usize];
+            reader.read_exact(&mut collected_source).unwrap();
+
+            ReceiverError::DeserializationError(
+              format!("{:?}", e),
+              unsafe { String::from_utf8_unchecked(collected_source) }
+            )
+          })?
+        },
       }
     } else {
       let reader = unsafe {
